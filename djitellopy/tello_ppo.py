@@ -20,7 +20,7 @@ tello.streamon()
 yolo_model = YOLO("yolov8n.pt")  # Replace with your model path
 
 # Initialize PPO model
-ppo_model = PPO.load("ppo_human_nav")
+ppo_model = PPO.load("gymnasium/ppo_human_nav")
 
 # Camera parameters
 frame_width = 960
@@ -33,8 +33,6 @@ max_height = 100  # 1m in cm
 min_distance_bbox_size = 0.7
 max_steps = 30
 move_distance = 20  # cm
-state_buffer = []  # For state smoothing
-max_buffer_size = 3  # Average over 3 frames
 
 def get_yolo_state(frame):
     """Process frame with YOLO, return state [dx, dy, bbox_size] for largest person or None."""
@@ -52,18 +50,12 @@ def get_yolo_state(frame):
                     max_area = area
                     dx = (x - frame_center_x) / (frame_width / 2)
                     dy = (y - frame_center_y) / (frame_height / 2)
-                    bbox_size = np.clip((w * h) / (frame_width * frame_height) * 5, 0, 1)  # Reduced multiplier
-                    best_state = np.array([dx, dy, bbox_size], dtype=np.float32)
-    if best_state is not None:
-        state_buffer.append(best_state)
-        if len(state_buffer) > max_buffer_size:
-            state_buffer.pop(0)
-        smoothed_state = np.mean(state_buffer, axis=0)
-        return np.clip(smoothed_state, -1, 1)
-    return None
+                    bbox_size = np.clip((w * h) / (frame_width * frame_height) * 8, 0, 1)  # Adjusted multiplier
+                    best_state = np.array([np.clip(dx, -1, 1), np.clip(dy, -1, 1), bbox_size], dtype=np.float32)
+    return best_state
 
-def draw_yolo_boxes(frame, results, state, action=None):
-    """Draw bounding boxes, state, and action on frame."""
+def draw_yolo_boxes(frame, results, state):
+    """Draw bounding boxes and state info on frame."""
     frame_copy = frame.copy()
     for result in results:
         boxes = result.boxes.xywh.cpu().numpy()
@@ -73,17 +65,11 @@ def draw_yolo_boxes(frame, results, state, action=None):
                 x, y, w, h = box
                 x1, y1 = int(x - w/2), int(y - h/2)
                 x2, y2 = int(x + w/2), int(y + h/2)
-                cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                cv2.putText(frame_copy, "Person", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame_copy, "Person", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     if state is not None:
-        # Estimate distance from bbox_size
-        distance = 2.0 / (state[2] + 0.2) if state[2] > 0 else 5.0
-        state_text = f"dx: {state[0]:.2f}, dy: {state[1]:.2f}, bbox_size: {state[2]:.2f}, dist: {distance:.2f}m"
-        cv2.putText(frame_copy, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-    if action is not None:
-        action_names = {0: "Forward", 1: "Back", 2: "Left", 3: "Right", 4: "Hover"}
-        action_text = f"Action: {action_names.get(action, 'Unknown')}"
-        cv2.putText(frame_copy, action_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 3)
+        state_text = f"dx: {state[0]:.2f}, dy: {state[1]:.2f}, bbox_size: {state[2]:.2f}"
+        cv2.putText(frame_copy, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     return frame_copy
 
 def map_action_to_tello(action):
@@ -109,9 +95,9 @@ with open("tello_log.txt", "w") as log_file:
         tello.takeoff()
         print("Takeoff complete, stabilizing...")
         log_file.write("Takeoff complete, stabilizing...\n")
-        time.sleep(3)
-        tello.set_speed(10)
+        time.sleep(3)  # Extended stabilization
 
+        tello.set_speed(10)
         steps = 0
         while steps < max_steps:
             # Get frame
@@ -121,18 +107,15 @@ with open("tello_log.txt", "w") as log_file:
             # Get state
             state = get_yolo_state(frame)
             results = yolo_model(frame)  # For visualization
-            frame_with_boxes = draw_yolo_boxes(frame, results, state, None)
+            frame_with_boxes = draw_yolo_boxes(frame, results, state)
             cv2.imshow("Tello Feed", frame_with_boxes)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
             if state is None:
-                
                 print("No human detected, hovering...")
                 log_file.write(f"Step {steps}: No human detected, hovering...\n")
                 tello.send_rc_control(0, 0, 0, 0)
-                frame_with_boxes = draw_yolo_boxes(frame, results, None, 4)
-                cv2.imshow("Tello Feed", frame_with_boxes)
                 steps += 1
                 time.sleep(0.5)
                 continue
@@ -145,19 +128,6 @@ with open("tello_log.txt", "w") as log_file:
                 print("Too close, hovering...")
                 log_file.write(f"Step {steps}: Too close, hovering...\n")
                 tello.send_rc_control(0, 0, 0, 0)
-                frame_with_boxes = draw_yolo_boxes(frame, results, state, 4)
-                cv2.imshow("Tello Feed", frame_with_boxes)
-                steps += 1
-                time.sleep(0.5)
-                continue
-
-            # Safety: Hover if centered
-            if abs(state[0]) < 0.2 and abs(state[1]) < 0.2:
-                print("Centered, hovering...")
-                log_file.write(f"Step {steps}: Centered, hovering...\n")
-                tello.send_rc_control(0, 0, 0, 0)
-                frame_with_boxes = draw_yolo_boxes(frame, results, state, 4)
-                cv2.imshow("Tello Feed", frame_with_boxes)
                 steps += 1
                 time.sleep(0.5)
                 continue
@@ -168,16 +138,12 @@ with open("tello_log.txt", "w") as log_file:
                 print(f"Height {current_height}cm, adjusting down...")
                 log_file.write(f"Step {steps}: Height {current_height}cm, adjusting down...\n")
                 tello.move_down(20)
-                frame_with_boxes = draw_yolo_boxes(frame, results, state, None)
-                cv2.imshow("Tello Feed", frame_with_boxes)
                 time.sleep(1)
                 continue
             elif current_height < 30:
                 print(f"Height {current_height}cm, adjusting up...")
                 log_file.write(f"Step {steps}: Height {current_height}cm, adjusting up...\n")
                 tello.move_up(20)
-                frame_with_boxes = draw_yolo_boxes(frame, results, state, None)
-                cv2.imshow("Tello Feed", frame_with_boxes)
                 time.sleep(1)
                 continue
 
@@ -190,14 +156,10 @@ with open("tello_log.txt", "w") as log_file:
             try:
                 tello_action = map_action_to_tello(action)
                 tello_action()
-                frame_with_boxes = draw_yolo_boxes(frame, results, state, action)
-                cv2.imshow("Tello Feed", frame_with_boxes)
             except Exception as e:
                 print(f"Action failed: {e}, retrying as hover...")
                 log_file.write(f"Step {steps}: Action failed: {e}, retrying as hover...\n")
                 tello.send_rc_control(0, 0, 0, 0)
-                frame_with_boxes = draw_yolo_boxes(frame, results, state, 4)
-                cv2.imshow("Tello Feed", frame_with_boxes)
             time.sleep(0.5)
 
             steps += 1
@@ -207,7 +169,7 @@ with open("tello_log.txt", "w") as log_file:
         log_file.write(f"Error: {e}\n")
     finally:
         tello.send_rc_control(0, 0, 0, 0)
-        for _ in range(3):
+        for _ in range(3):  # Retry landing
             try:
                 tello.land()
                 break
