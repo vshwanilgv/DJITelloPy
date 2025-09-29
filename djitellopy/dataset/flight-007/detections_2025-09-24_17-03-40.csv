@@ -1,0 +1,3 @@
+timestamp,class,confidence,x,y,w,h,action,height,temp,speed_x,speed_y,speed_z,flight_time,battery
+1758701027.038843,0,0.8094595074653625,512,264,105,185,move_forward,70,81.5,0,0,0,405,43
+1758701029.005706,0,0.848015546798706,513,275,111,199,move_forward,70,81.0,0,0,0,408,43
